@@ -21,6 +21,8 @@ connection_string_secret = "azure-connection-string"
 # Secret holding the HuggingFace token -> HF_TOKEN. Empty = skip (only needed
 # when convert.push_to_hub = true).
 hf_token_secret = "huggingface-token"
+# Secret holding the HuggingFace username -> HF_USER. Empty = skip.
+hf_user_secret = ""
 
 [models]
 # Optionally pull the YOLO detection/segmentation weights from Azure ML instead

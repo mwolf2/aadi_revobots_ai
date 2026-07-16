@@ -19,9 +19,11 @@ import os
 # Must match azure_blob_io.CONN_STR_ENV.
 CONN_STR_ENV = "AZURE_STORAGE_CONNECTION_STRING"
 HF_TOKEN_ENV = "HF_TOKEN"
+HF_USER_ENV = "HF_USER"
 
 
-def load_secrets(vault_url, connection_string_secret=None, hf_token_secret=None):
+def load_secrets(vault_url, connection_string_secret=None, hf_token_secret=None,
+                 hf_user_secret=None):
     """Fetch the named secrets from `vault_url` and export them as env vars.
 
     Only secrets whose name is provided (non-empty) are fetched; pass None/""
@@ -45,5 +47,9 @@ def load_secrets(vault_url, connection_string_secret=None, hf_token_secret=None)
         os.environ[HF_TOKEN_ENV] = client.get_secret(hf_token_secret).value
         injected.append(HF_TOKEN_ENV)
         print(f"[keyvault] Loaded {HF_TOKEN_ENV} from secret '{hf_token_secret}'.")
+    if hf_user_secret:
+        os.environ[HF_USER_ENV] = client.get_secret(hf_user_secret).value
+        injected.append(HF_USER_ENV)
+        print(f"[keyvault] Loaded {HF_USER_ENV} from secret '{hf_user_secret}'.")
 
     return injected

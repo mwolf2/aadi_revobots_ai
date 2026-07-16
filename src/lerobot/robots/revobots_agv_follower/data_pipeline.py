@@ -90,6 +90,7 @@ def load_config(path):
             "connection_string_secret": opt(
                 keyvault.get("connection_string_secret", "")),
             "hf_token_secret": opt(keyvault.get("hf_token_secret", "")),
+            "hf_user_secret": opt(keyvault.get("hf_user_secret", "")),
         },
         "azure": {
             "input_container": azure.get("input_container", "raw"),
@@ -179,6 +180,7 @@ def main():
             keyvault["vault_url"],
             connection_string_secret=keyvault["connection_string_secret"],
             hf_token_secret=keyvault["hf_token_secret"],
+            hf_user_secret=keyvault["hf_user_secret"],
         )
 
     if not convert["repo_id"]:
