@@ -43,13 +43,16 @@ except ModuleNotFoundError:  # Python 3.10
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../robots/revobots_agv_follower
 _REPO_SRC = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))  # .../src
 _MASK_DIR = os.path.join(_REPO_SRC, "lerobot", "cameras", "image_detection_tracking")
+_CICD_DIR = os.path.join(_REPO_SRC, "lerobot", "CICD")
 
 # The step modules live inside the robot package dir; importing them via the
 # package (lerobot.robots.revobots_agv_follower.*) would run its __init__.py,
 # which pulls in ROS. Load them as flat top-level modules from their sibling
-# directories. azure_blob_io lives alongside this script.
+# directories. The Azure helpers live in lerobot/CICD and are loaded the same
+# way (its directory is put on sys.path below).
 sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, _MASK_DIR)
+sys.path.insert(0, _CICD_DIR)
 
 from split_session_agv import run_split      # noqa: E402
 from data_convert_agv import run_convert     # noqa: E402
