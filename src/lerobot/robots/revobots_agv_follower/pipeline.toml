@@ -1,0 +1,104 @@
+# AGV data pipeline configuration.
+#
+# Credentials are NEVER read from this file. Set the Azure connection string
+# in the environment before running:
+#   export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=...;"
+#
+# Empty string ("") means "not set" and falls back to the documented default.
+
+[keyvault]
+# Optionally pull secrets from Azure Key Vault and inject them as environment
+# variables before the pipeline runs. Vault auth uses DefaultAzureCredential
+# (Managed Identity in Azure; `az login` / env vars / VS Code locally) — only
+# the vault URL and secret *names* live here, never the secret values.
+#
+# When enabled = false, the pipeline uses whatever AZURE_STORAGE_CONNECTION_STRING
+# / HF_TOKEN you set in the environment yourself.
+enabled = false
+vault_url = "https://YOUR-KEYVAULT-NAME.vault.azure.net/"
+# Secret holding the storage connection string -> AZURE_STORAGE_CONNECTION_STRING.
+connection_string_secret = "azure-connection-string"
+# Secret holding the HuggingFace token -> HF_TOKEN. Empty = skip (only needed
+# when convert.push_to_hub = true).
+hf_token_secret = "huggingface-token"
+
+[models]
+# Optionally pull the YOLO detection/segmentation weights from Azure ML instead
+# of using local files. Auth uses DefaultAzureCredential (same as [keyvault]).
+# Only used when mask.apply_mask = true. When enabled = false, the mask step
+# uses the local mask.seg_weights / mask.det_weights paths as-is.
+enabled = false
+# Source: set registry_name to pull from an Azure ML *registry*, OR set all
+# three workspace coordinates to pull from a *workspace*. Leave the unused ones
+# empty.
+registry_name = ""
+subscription_id = ""
+resource_group = ""
+workspace_name = ""
+# Where downloaded weights are staged. Empty = ~/.cache/scout/lab/ml_models.
+download_dir = ""
+# Registered model names + versions (empty version = latest). The .pt file is
+# located inside each downloaded artifact by the mask.*_weights filename, and
+# falls back to the first *.pt found.
+seg_model_name = "yolo26n-sem"
+seg_model_version = ""
+det_model_name = "yolo26n"
+det_model_version = ""
+
+[azure]
+# Blob container holding raw session_YYYYMMDD_123456/ folders.
+input_container = "raw"
+# Blob container the finished LeRobot dataset is uploaded to.
+output_container = "datasets"
+# Regex used to pick session folders in the input container. Empty = default.
+# Single-quoted literal string so the regex backslashes aren't escaped.
+session_pattern = '^session_\d{8}_\d{6}$'
+# Set false to build the dataset locally without pushing it to Azure.
+upload = true
+
+[source]
+# Choose at most ONE of input_path / split_dir. Leave both empty to download
+# raw sessions from azure.input_container.
+#
+# Local folder of raw sessions to split (skips the Azure download).
+input_path = ""
+# Existing split_session_<...>/ dir to reuse (skips download AND split).
+split_dir = ""
+# Where downloaded raw sessions are staged. Empty = timestamped dir under
+# ~/.cache/scout/lab/raw_download/.
+work_dir = ""
+
+[split]
+segment_minutes = 2
+# Where the split step writes its chunks. Empty = step default.
+split_out = ""
+
+[mask]
+# Run semantic segmentation on every split mp4 before conversion.
+apply_mask = true
+# Overwrite mp4s in the split dir (originals kept as session_<i>.raw.mp4).
+# Default (false) writes a masked mirror tree.
+mask_in_place = false
+# Output dir for the masked mirror tree. Empty = <split_dir>_masked/.
+# Ignored when mask_in_place = true.
+mask_out = ""
+seg_mode = "semantic"          # "semantic" or "segmentation"
+seg_weights = "best.pt"
+det_weights = "yolo26n.pt"
+seg_conf = 0.25
+# 0.0 = pure black background. >0 fades the raw frame in behind the mask.
+overlay_alpha = 0.0
+det_classes = [0, 1, 9, 10, 11, 12]
+
+[convert]
+# REQUIRED. HuggingFace-style dataset repo id, also used as the upload prefix.
+repo_id = "test-repo"
+task = "Drive the AGV."
+fps = 15
+robot_type = "revobots_agv_follower"
+image_writer_threads = 4
+video_encoding_batch_size = 1
+resume = false
+push_to_hub = false
+no_videos = false
+no_obs_processor = false

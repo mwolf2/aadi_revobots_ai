@@ -66,7 +66,7 @@ import numpy as np
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.processor import make_default_processors          # [SYMMETRY] new import
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -445,10 +445,6 @@ def run_convert(
                     outer.update(1)
             finally:
                 outer.close()
-
-            print("\n[*] Force-closing data parquet writer...")
-            dataset._close_writer()
-            dataset.meta._close_writer()
     finally:
         print("[*] Finalizing dataset...")
         try:

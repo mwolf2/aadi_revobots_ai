@@ -69,9 +69,9 @@ class SemanticMasker:
         return tuple(int(c * factor) for c in color)
 
     def _draw_semantic(self, sem_result, canvas):
-        if sem_result.semantic_masks is None:
+        if sem_result.semantic_mask is None:
             return canvas
-        class_map = sem_result.semantic_masks.data.cpu().numpy()
+        class_map = sem_result.semantic_mask.data.cpu().numpy()
         for cls in np.unique(class_map):
             if cls == self.ignore_class:
                 continue
@@ -155,22 +155,41 @@ def _find_sessions(parent_dir: Path):
     return out
 
 
-def _mask_one_video(masker: SemanticMasker, src_mp4: Path, dst_mp4: Path):
+def _mask_one_video(masker: SemanticMasker, src_mp4: Path, dst_mp4: Path,
+                    fps_override=None):
     cap = cv2.VideoCapture(str(src_mp4))
     if not cap.isOpened():
         print(f"[!] Could not open {src_mp4}, skipping.")
         return 0
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    # OpenCV returns 0.0 for CAP_PROP_FPS on some mp4s; a zero/invalid fps makes
+    # VideoWriter silently refuse to open and write nothing. Prefer the fps the
+    # pipeline was configured with, then the source's, then a sane fallback.
+    fps = fps_override or src_fps
+    if not fps or fps <= 0:
+        fps = 30.0
+        print(f"[!] {src_mp4.name}: invalid source fps ({src_fps!r}); "
+              f"falling back to {fps}.")
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     # Write to a temp path so a crash mid-encode never leaves a half-written
-    # file at the final path (which convert would happily consume).
-    tmp = dst_mp4.with_suffix(".mp4.tmp")
+    # file at the final path (which convert would happily consume). The temp
+    # name MUST keep the .mp4 extension: OpenCV's FFmpeg backend picks the
+    # output container from the extension, and a ".tmp" suffix leaves it unable
+    # to infer a muxer, so VideoWriter silently fails to open.
+    tmp = dst_mp4.with_name(dst_mp4.stem + ".partial" + dst_mp4.suffix)
     writer = cv2.VideoWriter(str(tmp), fourcc, fps, (w, h))
+    if not writer.isOpened():
+        cap.release()
+        raise SystemExit(
+            f"[!] cv2.VideoWriter could not open an encoder for {tmp} "
+            f"(fps={fps}, size={w}x{h}, fourcc=mp4v). The source clip may be "
+            f"invalid, or this OpenCV build lacks an mp4v encoder."
+        )
 
     pbar = tqdm(total=total, desc=f"  {src_mp4.parent.name}", unit="f",
                 leave=True, dynamic_ncols=True)
@@ -189,6 +208,11 @@ def _mask_one_video(masker: SemanticMasker, src_mp4: Path, dst_mp4: Path):
         writer.release()
         pbar.close()
 
+    if not tmp.exists():
+        raise SystemExit(
+            f"[!] Masking wrote no output for {src_mp4} ({n} frame(s) read); "
+            f"leaving {dst_mp4} untouched."
+        )
     os.replace(tmp, dst_mp4)
     return n
 
@@ -203,6 +227,7 @@ def run_mask(
     seg_conf: float = 0.25,
     overlay_alpha: float = 0.0,
     in_place: bool = False,
+    fps=None,
 ):
     """Mask every session_<i>.mp4 under `parent_dir`.
 
@@ -261,7 +286,8 @@ def run_mask(
                 shutil.copy2(src_jsonl, dst_dir / f"{name}.jsonl")
 
             dst_mp4 = dst_dir / f"{name}.mp4"
-            total_frames += _mask_one_video(masker, src_mp4, dst_mp4)
+            total_frames += _mask_one_video(masker, src_mp4, dst_mp4,
+                                             fps_override=fps)
             outer.set_postfix(frames=total_frames)
             outer.update(1)
     finally:
