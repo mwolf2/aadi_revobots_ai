@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
 """Azure Blob Storage helpers for the AGV data pipeline.
 
-Auth: the connection string is read from the AZURE_STORAGE_CONNECTION_STRING
-environment variable (Azure Portal -> Storage account -> Access keys ->
-Connection string). Nothing sensitive is ever read from the TOML config.
+Auth, in order of preference:
+  * If an `account_url` is supplied (from azure.account_url in the TOML), use
+    DefaultAzureCredential — a Managed Identity when running on Azure, falling
+    back to `az login` / env vars locally. No account key involved.
+  * Otherwise read the connection string from the AZURE_STORAGE_CONNECTION_STRING
+    environment variable (Azure Portal -> Storage account -> Access keys).
+
+Nothing sensitive is ever read from the TOML config — only the account URL.
 
 Requires:  pip install azure-storage-blob
+           pip install azure-identity   (only for the managed-identity path)
 """
 
 import os
@@ -23,10 +29,22 @@ DEFAULT_SESSION_PATTERN = r"^session_\d{8}_\d{6}$"
 CONN_STR_ENV = "AZURE_STORAGE_CONNECTION_STRING"
 
 
-def _service() -> BlobServiceClient:
+def _service(account_url=None) -> BlobServiceClient:
+    """Return a BlobServiceClient.
+
+    With `account_url` set, authenticate via DefaultAzureCredential (Managed
+    Identity on Azure; az login / env vars locally) — no key required. Without
+    it, fall back to the connection string in AZURE_STORAGE_CONNECTION_STRING.
+    """
+    if account_url:
+        # Imported lazily so connection-string users don't need azure-identity.
+        from azure.identity import DefaultAzureCredential
+        return BlobServiceClient(account_url=account_url,
+                                 credential=DefaultAzureCredential())
     conn_str = os.environ.get(CONN_STR_ENV)
     if not conn_str:
-        sys.exit(f"Set {CONN_STR_ENV} first (Azure connection string).")
+        sys.exit(f"Set {CONN_STR_ENV} (connection string), or configure "
+                 f"azure.account_url for managed-identity auth.")
     return BlobServiceClient.from_connection_string(conn_str)
 
 
@@ -48,11 +66,12 @@ def _is_dir_marker(blob) -> bool:
     return meta.get("hdi_isfolder") == "true"
 
 
-def list_session_folders(container_name: str, pattern: str = DEFAULT_SESSION_PATTERN) -> list[str]:
+def list_session_folders(container_name: str, pattern: str = DEFAULT_SESSION_PATTERN,
+                         account_url: str = None) -> list[str]:
     """Return the sorted set of top-level folder names in `container_name`
     that match `pattern` (e.g. session_20260714_123456)."""
     regex = re.compile(pattern)
-    container = _service().get_container_client(container_name)
+    container = _service(account_url).get_container_client(container_name)
     names: set[str] = set()
     for blob in container.list_blobs(include=["metadata"]):
         top = _top_folder(blob.name)
@@ -65,6 +84,7 @@ def download_sessions(
     container_name: str,
     dest_dir: str | os.PathLike,
     pattern: str = DEFAULT_SESSION_PATTERN,
+    account_url: str = None,
 ) -> list[str]:
     """Download every blob whose top-level folder matches `pattern` from
     `container_name` into `dest_dir`, preserving the folder layout.
@@ -72,7 +92,7 @@ def download_sessions(
     Returns the sorted list of session folder names that were downloaded.
     """
     regex = re.compile(pattern)
-    container = _service().get_container_client(container_name)
+    container = _service(account_url).get_container_client(container_name)
     dest_dir = Path(dest_dir)
 
     downloaded: set[str] = set()
@@ -101,11 +121,12 @@ def upload_directory(
     container_name: str,
     local_dir: str | os.PathLike,
     dest_prefix: str = "",
+    account_url: str = None,
 ) -> int:
     """Recursively upload every file under `local_dir` to `container_name`,
     preserving the relative layout under `dest_prefix`. Overwrites existing
     blobs. Returns the number of files uploaded."""
-    service = _service()
+    service = _service(account_url)
     container = service.get_container_client(container_name)
 
     # Create the container if it doesn't exist yet.

@@ -96,6 +96,7 @@ def load_config(path):
             "output_container": azure.get("output_container", "datasets"),
             "session_pattern": azure.get("session_pattern",
                                          azure_blob_io.DEFAULT_SESSION_PATTERN),
+            "account_url": opt(azure.get("account_url", "")),
             "upload": azure.get("upload", True),
         },
         "source": {
@@ -216,6 +217,7 @@ def main():
             sessions = azure_blob_io.download_sessions(
                 azure["input_container"], raw_dir,
                 pattern=azure["session_pattern"],
+                account_url=azure["account_url"],
             )
             if not sessions:
                 raise SystemExit(
@@ -308,6 +310,7 @@ def main():
         azure_blob_io.upload_directory(
             azure["output_container"], dataset_root,
             dest_prefix=convert["repo_id"],
+            account_url=azure["account_url"],
         )
 
     print(f"\n[pipeline] Done. Dataset at: {dataset_root}")

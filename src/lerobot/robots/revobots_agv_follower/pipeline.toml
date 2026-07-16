@@ -53,6 +53,11 @@ output_container = "datasets"
 # Regex used to pick session folders in the input container. Empty = default.
 # Single-quoted literal string so the regex backslashes aren't escaped.
 session_pattern = '^session_\d{8}_\d{6}$'
+# Blob endpoint for managed-identity auth, e.g.
+# "https://<account>.blob.core.windows.net". When set, blob download/upload use
+# DefaultAzureCredential (Managed Identity on Azure) instead of a connection
+# string. Leave empty to authenticate with AZURE_STORAGE_CONNECTION_STRING.
+account_url = ""
 # Set false to build the dataset locally without pushing it to Azure.
 upload = true
 
