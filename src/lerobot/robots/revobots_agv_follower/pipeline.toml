@@ -42,6 +42,8 @@ download_dir = ""
 # Registered model names + versions (empty version = latest). The .pt file is
 # located inside each downloaded artifact by the mask.*_weights filename, and
 # falls back to the first *.pt found.
+# seg_model_name / det_model_name are overridden by the SEG_MODEL_NAME /
+# DET_MODEL_NAME env vars when set.
 seg_model_name = "yolo26n-sem"
 seg_model_version = ""
 det_model_name = "yolo26n"

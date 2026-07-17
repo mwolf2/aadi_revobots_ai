@@ -130,9 +130,12 @@ def load_config(path):
             "resource_group": opt(models.get("resource_group", "")),
             "workspace_name": opt(models.get("workspace_name", "")),
             "download_dir": opt(models.get("download_dir", "")),
-            "seg_model_name": opt(models.get("seg_model_name", "")),
+            # Env vars (passed via docker -e) override the TOML when set.
+            "seg_model_name": (os.environ.get("SEG_MODEL_NAME")
+                               or opt(models.get("seg_model_name", ""))),
             "seg_model_version": opt(models.get("seg_model_version", "")),
-            "det_model_name": opt(models.get("det_model_name", "")),
+            "det_model_name": (os.environ.get("DET_MODEL_NAME")
+                               or opt(models.get("det_model_name", ""))),
             "det_model_version": opt(models.get("det_model_version", "")),
         },
         "mask": {
