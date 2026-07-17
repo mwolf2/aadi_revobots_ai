@@ -49,9 +49,11 @@ det_model_version = ""
 
 [azure]
 # Blob container holding raw session_YYYYMMDD_123456/ folders.
-input_container = "raw"
+# Set via the INPUT_CONTAINER env var (docker -e); default if unset: "raw".
+# input_container = "raw"
 # Blob container the finished LeRobot dataset is uploaded to.
-output_container = "datasets"
+# Set via the OUTPUT_CONTAINER env var (docker -e); default if unset: "datasets".
+# output_container = "datasets"
 # Regex used to pick session folders in the input container. Empty = default.
 # Single-quoted literal string so the regex backslashes aren't escaped.
 session_pattern = '^session_\d{8}_\d{6}$'
@@ -99,13 +101,15 @@ det_classes = [0, 1, 9, 10, 11, 12]
 
 [convert]
 # REQUIRED. HuggingFace-style dataset repo id, also used as the upload prefix.
-repo_id = "test-repo"
+# Set via the REPO_ID env var (docker -e).
+# repo_id = "test-repo"
 task = "Drive the AGV."
 fps = 15
 robot_type = "revobots_agv_follower"
 image_writer_threads = 4
 video_encoding_batch_size = 1
-resume = false
+# Resume an interrupted dataset build. Set via the RESUME env var (docker -e).
+# resume = false
 push_to_hub = false
 no_videos = false
 no_obs_processor = false

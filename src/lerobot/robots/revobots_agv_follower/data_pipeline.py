@@ -86,6 +86,14 @@ def load_config(path):
         """Treat empty strings in the TOML as 'not set'."""
         return value if value else None
 
+    def env_bool(name, default):
+        """Read a boolean from an env var (docker -e), falling back to the TOML
+        value. Accepts 1/true/yes/on (case-insensitive) as true."""
+        v = os.environ.get(name)
+        if not v:
+            return default
+        return v.strip().lower() in ("1", "true", "yes", "on")
+
     return {
         "keyvault": {
             "enabled": keyvault.get("enabled", False),
@@ -96,8 +104,11 @@ def load_config(path):
             "hf_user_secret": opt(keyvault.get("hf_user_secret", "")),
         },
         "azure": {
-            "input_container": azure.get("input_container", "raw"),
-            "output_container": azure.get("output_container", "datasets"),
+            # Env vars (passed via docker -e) override the TOML when set.
+            "input_container": (os.environ.get("INPUT_CONTAINER")
+                                or azure.get("input_container", "raw")),
+            "output_container": (os.environ.get("OUTPUT_CONTAINER")
+                                 or azure.get("output_container", "datasets")),
             "session_pattern": azure.get("session_pattern",
                                          azure_blob_io.DEFAULT_SESSION_PATTERN),
             "account_url": opt(azure.get("account_url", "")),
@@ -136,13 +147,15 @@ def load_config(path):
             "det_classes": mask.get("det_classes", [0, 1, 9, 10, 11, 12]),
         },
         "convert": {
-            "repo_id": convert.get("repo_id"),
+            # Env var (passed via docker -e) overrides the TOML when set.
+            "repo_id": os.environ.get("REPO_ID") or convert.get("repo_id"),
             "task": convert.get("task", "Drive the AGV."),
             "fps": convert.get("fps", 15),
             "robot_type": convert.get("robot_type", "revobots_agv_follower"),
             "image_writer_threads": convert.get("image_writer_threads", 4),
             "video_encoding_batch_size": convert.get("video_encoding_batch_size", 1),
-            "resume": convert.get("resume", False),
+            # Env var (passed via docker -e) overrides the TOML when set.
+            "resume": env_bool("RESUME", convert.get("resume", False)),
             "push_to_hub": convert.get("push_to_hub", False),
             "no_videos": convert.get("no_videos", False),
             "no_obs_processor": convert.get("no_obs_processor", False),
@@ -191,7 +204,8 @@ def main():
 
     # Stamp the dataset name with the current date (MMDDYYYY) so each run is
     # uniquely identifiable both on disk/hub and in the upload prefix.
-    convert["repo_id"] = f"{convert['repo_id']}_{datetime.now().strftime('%m%d%Y')}"
+    # Disabled for now:
+    # convert["repo_id"] = f"{convert['repo_id']}_{datetime.now().strftime('%m%d%Y')}"
     print(f"[pipeline] Dataset repo_id: {convert['repo_id']}")
 
     if source["input_path"] and source["split_dir"]:
