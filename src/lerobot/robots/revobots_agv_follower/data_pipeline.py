@@ -9,7 +9,9 @@ Lives at: src/lerobot/robots/revobots_agv_follower/data_pipeline.py
 Runs, in order:
     0.   download          — pull every session_YYYYMMDD_123456/ folder from the
                              input blob container (default "raw") to a local
-                             work dir.
+                             work dir. azure.input_prefix scopes this to one
+                             folder inside that container (e.g. a route), so a
+                             run can train on one route's sessions only.
     1.   split_session_agv — chop raw session(s) (video.mp4 + data.jsonl) into
                              fixed-length session_<i>/ chunks.
     1.5  mask_sessions_agv — (optional) replace each session_<i>.mp4 with a
@@ -109,6 +111,12 @@ def load_config(path):
                                 or azure.get("input_container", "raw")),
             "output_container": (os.environ.get("OUTPUT_CONTAINER")
                                  or azure.get("output_container", "datasets")),
+            # `is not None`, not `or`, unlike the two above: "" is a real value
+            # here ("the container root"), so INPUT_PREFIX="" has to be able to
+            # cancel a prefix set in the TOML rather than fall back to it.
+            "input_prefix": (os.environ["INPUT_PREFIX"]
+                             if os.environ.get("INPUT_PREFIX") is not None
+                             else azure.get("input_prefix", "")),
             "session_pattern": azure.get("session_pattern",
                                          azure_blob_io.DEFAULT_SESSION_PATTERN),
             "account_url": opt(azure.get("account_url", "")),
@@ -233,19 +241,25 @@ def main():
                 raw_dir = os.path.expanduser(
                     f"~/.cache/scout/lab/raw_download/raw_{timestamp}"
                 )
+            # Printed as container/prefix so the log says exactly which slice of
+            # the corpus a run covered — the whole container, or one route.
+            source_desc = azure["input_container"]
+            if azure["input_prefix"]:
+                source_desc += "/" + azure["input_prefix"].strip("/")
             print(f"[pipeline] === Step 0/4: downloading raw sessions from "
-                  f"container '{azure['input_container']}' ===")
+                  f"'{source_desc}' ===")
             print(f"[pipeline] Staging to: {raw_dir}")
             sessions = azure_blob_io.download_sessions(
                 azure["input_container"], raw_dir,
                 pattern=azure["session_pattern"],
                 account_url=azure["account_url"],
+                prefix=azure["input_prefix"],
             )
             if not sessions:
                 raise SystemExit(
                     f"[pipeline] No session folders matching "
-                    f"{azure['session_pattern']!r} found in container "
-                    f"'{azure['input_container']}'; aborting."
+                    f"{azure['session_pattern']!r} found in "
+                    f"'{source_desc}'; aborting."
                 )
             print(f"[pipeline] Sessions: {', '.join(sessions)}\n")
 

@@ -56,6 +56,12 @@ det_model_version = ""
 # Blob container the finished LeRobot dataset is uploaded to.
 # Set via the OUTPUT_CONTAINER env var (docker -e); default if unset: "datasets".
 # output_container = "datasets"
+# Folder inside the input container to read sessions from, e.g. a route name.
+# Empty (the default) reads session folders at the container root. Session
+# folders are matched *inside* this folder, and the prefix is stripped locally,
+# so nothing downstream of the download changes.
+# Set via the INPUT_PREFIX env var (docker -e); default if unset: "".
+# input_prefix = ""
 # Regex used to pick session folders in the input container. Empty = default.
 # Single-quoted literal string so the regex backslashes aren't escaped.
 session_pattern = '^session_\d{8}_\d{6}$'

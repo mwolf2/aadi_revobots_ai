@@ -23,7 +23,8 @@ from azure.storage.blob import BlobServiceClient
 
 # Raw session folders are named session_YYYYMMDD_123456, where the trailing
 # six digits vary. Blob names are flat, so the "folder" is just the first
-# path segment of the blob name.
+# path segment of the blob name — or of what's left of it after an
+# `input_prefix` (e.g. a route folder) is stripped off the front.
 DEFAULT_SESSION_PATTERN = r"^session_\d{8}_\d{6}$"
 
 CONN_STR_ENV = "AZURE_STORAGE_CONNECTION_STRING"
@@ -48,18 +49,47 @@ def _service(account_url=None) -> BlobServiceClient:
     return BlobServiceClient.from_connection_string(conn_str)
 
 
+def _normalize_prefix(prefix):
+    """Return `prefix` as a bare `folder/` (or `a/b/`), or "" when unset.
+
+    Accepts "route_a", "route_a/", "/route_a/" alike so a config value doesn't
+    have to be written in one exact shape.
+    """
+    if not prefix:
+        return ""
+    return prefix.strip("/") + "/"
+
+
+def _relative_name(blob_name: str, prefix: str):
+    """Strip `prefix` off `blob_name`, or return None if the blob is outside it.
+
+    Everything downstream — the session-folder match and the local download
+    path — works on this relative name, so a run scoped to a route folder sees
+    exactly what an unscoped run over that same container root would see.
+    """
+    if not prefix:
+        return blob_name
+    if not blob_name.startswith(prefix):
+        return None
+    return blob_name[len(prefix):]
+
+
 def _top_folder(blob_name: str) -> str:
     """First path segment of a blob name — the virtual top-level folder."""
     return blob_name.split("/", 1)[0]
 
 
-def _is_dir_marker(blob) -> bool:
+def _is_dir_marker(blob, rel_name: str) -> bool:
     """True for the 0-byte placeholder blobs Azure uses to represent a folder
     (e.g. a blob literally named 'session_X' or one ending in '/'). These are
     not real files — downloading them would create a file where we later need
-    a directory."""
-    name = blob.name
-    if name.endswith("/") or "/" not in name:
+    a directory.
+
+    Judged on the *prefix-relative* name: under a route folder the marker for
+    session_X is named 'route_a/session_X', which does contain a slash and
+    would slip past the check if the raw blob name were used.
+    """
+    if rel_name.endswith("/") or "/" not in rel_name:
         return True
     # ADLS Gen2 hierarchical-namespace folder markers.
     meta = getattr(blob, "metadata", None) or {}
@@ -67,14 +97,22 @@ def _is_dir_marker(blob) -> bool:
 
 
 def list_session_folders(container_name: str, pattern: str = DEFAULT_SESSION_PATTERN,
-                         account_url: str = None) -> list[str]:
-    """Return the sorted set of top-level folder names in `container_name`
-    that match `pattern` (e.g. session_20260714_123456)."""
+                         account_url: str = None, prefix: str = "") -> list[str]:
+    """Return the sorted set of session folder names in `container_name` that
+    match `pattern` (e.g. session_20260714_123456).
+
+    With `prefix` set (e.g. "route_a"), only that folder is searched and the
+    names returned are relative to it — the route segment is not part of them.
+    """
     regex = re.compile(pattern)
+    prefix = _normalize_prefix(prefix)
     container = _service(account_url).get_container_client(container_name)
     names: set[str] = set()
-    for blob in container.list_blobs(include=["metadata"]):
-        top = _top_folder(blob.name)
+    for blob in container.list_blobs(name_starts_with=prefix, include=["metadata"]):
+        rel = _relative_name(blob.name, prefix)
+        if rel is None:
+            continue
+        top = _top_folder(rel)
         if regex.match(top):
             names.add(top)
     return sorted(names)
@@ -85,26 +123,39 @@ def download_sessions(
     dest_dir: str | os.PathLike,
     pattern: str = DEFAULT_SESSION_PATTERN,
     account_url: str = None,
+    prefix: str = "",
 ) -> list[str]:
-    """Download every blob whose top-level folder matches `pattern` from
+    """Download every blob whose session folder matches `pattern` from
     `container_name` into `dest_dir`, preserving the folder layout.
+
+    `prefix` scopes the download to one folder inside the container (e.g. a
+    route: "route_a"), and is stripped from the local paths — sessions land
+    directly under `dest_dir` either way, so the split step downstream sees the
+    same layout whether or not the corpus is organized into route folders.
 
     Returns the sorted list of session folder names that were downloaded.
     """
     regex = re.compile(pattern)
+    prefix = _normalize_prefix(prefix)
     container = _service(account_url).get_container_client(container_name)
     dest_dir = Path(dest_dir)
 
     downloaded: set[str] = set()
     n_blobs = 0
-    for blob in container.list_blobs(include=["metadata"]):
-        top = _top_folder(blob.name)
+    # name_starts_with keeps a prefixed run from paging through every other
+    # route's blobs server-side, rather than listing the whole container and
+    # discarding most of it here.
+    for blob in container.list_blobs(name_starts_with=prefix, include=["metadata"]):
+        rel = _relative_name(blob.name, prefix)
+        if rel is None:
+            continue
+        top = _top_folder(rel)
         if not regex.match(top):
             continue
-        if _is_dir_marker(blob):
+        if _is_dir_marker(blob, rel):
             continue
 
-        target = dest_dir / blob.name
+        target = dest_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         print(f"      [download] {blob.name} ({blob.size} bytes)")
         with open(target, "wb") as fh:
