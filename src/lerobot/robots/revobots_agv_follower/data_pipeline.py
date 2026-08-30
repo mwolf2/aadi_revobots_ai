@@ -22,6 +22,13 @@ Runs, in order:
     3.   upload            — push the finished dataset to the output blob
                              container (default "datasets").
 
+With [train_test_split].enabled the raw sessions are partitioned into a train
+group and a test group BEFORE step 1, and steps 1-3 then run once per group,
+producing two independent datasets: <repo_id>_train and <repo_id>_test. The
+partition is at the session level, never the chunk/episode level — every chunk
+cut out of one raw session stays on the same side — and is seeded, so the same
+set of session names plus the same seed reproduces the same split exactly.
+
 Everything is driven by a TOML config file (default: pipeline.toml next to this
 script); the only command-line argument is --config. Credentials are read from
 the AZURE_STORAGE_CONNECTION_STRING environment variable — never from the TOML.
@@ -34,6 +41,7 @@ Example:
 
 import argparse
 import os
+import random
 import sys
 from datetime import datetime
 
@@ -56,7 +64,7 @@ sys.path.insert(0, _THIS_DIR)
 sys.path.insert(0, _MASK_DIR)
 sys.path.insert(0, _CICD_DIR)
 
-from split_session_agv import run_split      # noqa: E402
+from split_session_agv import find_sessions, run_split   # noqa: E402
 from data_convert_agv import run_convert     # noqa: E402
 from mask_sessions_agv import run_mask       # noqa: E402
 
@@ -80,6 +88,7 @@ def load_config(path):
     azure = raw.get("azure", {})
     source = raw.get("source", {})
     split = raw.get("split", {})
+    train_test = raw.get("train_test_split", {})
     mask = raw.get("mask", {})
     models = raw.get("models", {})
     convert = raw.get("convert", {})
@@ -95,6 +104,20 @@ def load_config(path):
         if not v:
             return default
         return v.strip().lower() in ("1", "true", "yes", "on")
+
+    def env_number(name, default, cast):
+        """Read a number from an env var (docker -e), falling back to the TOML
+        value. A malformed value is a hard error rather than a silent fallback:
+        a typo'd TEST_RATIO would otherwise quietly produce a differently-sized
+        test set than the run was asked for."""
+        v = os.environ.get(name)
+        if not v:
+            return default
+        try:
+            return cast(v)
+        except ValueError:
+            raise SystemExit(f"[pipeline] {name}={v!r} is not a valid "
+                             f"{cast.__name__}.")
 
     return {
         "keyvault": {
@@ -130,6 +153,20 @@ def load_config(path):
         "split": {
             "segment_minutes": split.get("segment_minutes", 2),
             "split_out": opt(split.get("split_out", "")),
+        },
+        "train_test_split": {
+            # Env vars (passed via docker -e) override the TOML when set.
+            "enabled": env_bool("TRAIN_TEST_SPLIT",
+                                train_test.get("enabled", False)),
+            "test_ratio": env_number("TEST_RATIO",
+                                     train_test.get("test_ratio", 0.2), float),
+            "seed": env_number("TRAIN_TEST_SEED",
+                               train_test.get("seed", 42), int),
+            # Appended to convert.repo_id for each side. Not opt()-ed: an empty
+            # suffix would collide the two datasets onto one repo id, so it is
+            # validated as non-empty and distinct before any work starts.
+            "train_suffix": train_test.get("train_suffix", "_train"),
+            "test_suffix": train_test.get("test_suffix", "_test"),
         },
         "models": {
             "enabled": models.get("enabled", False),
@@ -174,6 +211,150 @@ def load_config(path):
     }
 
 
+def partition_sessions(session_names, test_ratio, seed):
+    """Deterministically partition raw session folder names into (train, test).
+
+    The partition is at the SESSION level, never the chunk/episode level: every
+    fixed-length chunk that split_session_agv later cuts out of one raw session
+    lands on the same side. A test session is therefore a genuinely unseen
+    recording, not an interleaved sample from a recording the policy already
+    trained on.
+
+    The names are sorted before shuffling, so the result depends only on the
+    SET of session names and the seed — not on the order the blob listing or
+    the local directory walk happened to return them in. Same corpus + same
+    seed reproduces the same split exactly, on any machine.
+    """
+    ordered = sorted(session_names)
+    if len(ordered) < 2:
+        raise SystemExit(
+            f"[pipeline] train_test_split.enabled is true but only "
+            f"{len(ordered)} session(s) were found; at least 2 are needed to "
+            f"put a whole session on each side."
+        )
+    if not 0.0 < test_ratio < 1.0:
+        raise SystemExit(
+            f"[pipeline] train_test_split.test_ratio must be strictly between "
+            f"0 and 1; got {test_ratio}."
+        )
+
+    shuffled = list(ordered)
+    random.Random(seed).shuffle(shuffled)
+
+    # Clamped to leave at least one session on each side: on a small corpus
+    # round() can land on 0 (or on everything), which would produce an empty
+    # dataset that only fails much later, in the convert step.
+    n_test = int(round(len(shuffled) * test_ratio))
+    n_test = min(max(n_test, 1), len(shuffled) - 1)
+
+    return sorted(shuffled[n_test:]), sorted(shuffled[:n_test])
+
+
+def build_dataset(cfg, *, label, suffix, only_sessions, raw_dir, pre_split_dir,
+                  seg_weights, det_weights, run_stamp):
+    """Run split -> mask -> convert -> upload over one side of the corpus.
+
+    `suffix` is appended to convert.repo_id and to every configured
+    intermediate output dir, so the two sides of a train/test split never write
+    over each other. With suffix="" / only_sessions=None this is exactly the
+    original single-dataset run.
+
+    `seg_weights`/`det_weights` are resolved by the caller rather than here, so
+    a two-sided run downloads the YOLO weights from Azure ML once, not twice.
+
+    Returns the dataset root path.
+    """
+    azure = cfg["azure"]
+    split = cfg["split"]
+    mask = cfg["mask"]
+    convert = cfg["convert"]
+
+    tag = f"[pipeline] [{label}]" if label else "[pipeline]"
+    repo_id = convert["repo_id"] + suffix
+
+    # --- Step 1: split ------------------------------------------------------
+    if pre_split_dir:
+        parent_dir = pre_split_dir
+    else:
+        if split["split_out"]:
+            split_out = split["split_out"] + suffix
+        elif suffix:
+            # run_split's own default names its dir by the current minute, so
+            # two sides submitted back to back would land in the same folder
+            # and interleave their session_<i>/ numbering. Name them here
+            # instead, off one stamp taken before either side started.
+            split_out = os.path.expanduser(
+                f"~/.cache/scout/lab/split_session/split_session_{run_stamp}{suffix}"
+            )
+        else:
+            split_out = None
+
+        print(f"\n{tag} === Step 1/4: splitting sessions ===")
+        if only_sessions is not None:
+            print(f"{tag} Sessions in this split ({len(only_sessions)}): "
+                  f"{', '.join(only_sessions)}")
+        parent_dir = run_split(
+            raw_dir,
+            output_root=split_out,
+            fps=convert["fps"],
+            segment_minutes=split["segment_minutes"],
+            only_sessions=only_sessions,
+        )
+        if not parent_dir:
+            raise SystemExit(f"{tag} Split step produced no output; aborting.")
+
+    # --- Step 2: mask (optional) -------------------------------------------
+    if mask["apply_mask"]:
+        print(f"\n{tag} === Step 2/4: masking session videos ===")
+        parent_dir = run_mask(
+            parent_dir=parent_dir,
+            # Empty mask_out falls through to run_mask's <parent_dir>_masked
+            # default, which is already per-side because parent_dir is.
+            output_dir=(mask["mask_out"] + suffix) if mask["mask_out"] else None,
+            seg_mode=mask["seg_mode"],
+            seg_weights=seg_weights,
+            det_weights=det_weights,
+            det_classes_to_keep=tuple(mask["det_classes"]),
+            seg_conf=mask["seg_conf"],
+            overlay_alpha=mask["overlay_alpha"],
+            in_place=mask["mask_in_place"],
+            fps=convert["fps"],
+        )
+    else:
+        print(f"\n{tag} Skipping mask step (mask.apply_mask is false).")
+
+    # --- Step 3: convert ---------------------------------------------------
+    print(f"\n{tag} === Step 3/4: building LeRobot dataset '{repo_id}' ===")
+    dataset_root = run_convert(
+        parent_dir=parent_dir,
+        repo_id=repo_id,
+        task=convert["task"],
+        fps=convert["fps"],
+        robot_type=convert["robot_type"],
+        image_writer_threads=convert["image_writer_threads"],
+        video_encoding_batch_size=convert["video_encoding_batch_size"],
+        resume=convert["resume"],
+        push_to_hub=convert["push_to_hub"],
+        no_videos=convert["no_videos"],
+        no_obs_processor=convert["no_obs_processor"],
+    )
+    print(f"\n{tag} Dataset written to: {dataset_root}")
+
+    # --- Step 4: upload ----------------------------------------------------
+    if not azure["upload"]:
+        print(f"{tag} azure.upload is false; skipping dataset upload.")
+    else:
+        print(f"\n{tag} === Step 4/4: uploading dataset to container "
+              f"'{azure['output_container']}' ===")
+        azure_blob_io.upload_directory(
+            azure["output_container"], dataset_root,
+            dest_prefix=repo_id,
+            account_url=azure["account_url"],
+        )
+
+    return dataset_root
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -190,7 +371,7 @@ def main():
     keyvault = cfg["keyvault"]
     azure = cfg["azure"]
     source = cfg["source"]
-    split = cfg["split"]
+    train_test = cfg["train_test_split"]
     mask = cfg["mask"]
     models = cfg["models"]
     convert = cfg["convert"]
@@ -223,133 +404,138 @@ def main():
         raise SystemExit("[pipeline] Set only one of source.input_path / "
                          "source.split_dir in the config.")
 
-    fps = convert["fps"]
+    # Validated before the download, not after: a bad suffix pair would collide
+    # both sides onto one repo id, and there is no point discovering that after
+    # pulling the whole corpus down.
+    if train_test["enabled"]:
+        if source["split_dir"]:
+            raise SystemExit(
+                "[pipeline] train_test_split.enabled is true, but source.split_dir "
+                "points at an already-chopped split_session_<...>/ dir. Its "
+                "session_<i>/ chunks are numbered continuously across the raw "
+                "sessions they came from, so the raw-session boundaries a "
+                "session-level split needs are no longer recoverable. Use "
+                "source.input_path (or the blob container) instead."
+            )
+        if not train_test["train_suffix"] or not train_test["test_suffix"]:
+            raise SystemExit("[pipeline] train_test_split.train_suffix and "
+                             ".test_suffix must both be non-empty.")
+        if train_test["train_suffix"] == train_test["test_suffix"]:
+            raise SystemExit("[pipeline] train_test_split.train_suffix and "
+                             ".test_suffix must differ.")
 
     # --- Step 0: obtain raw sessions ---------------------------------------
+    raw_dir = None
+    pre_split_dir = None
+    session_names = []
+
     if source["split_dir"]:
-        parent_dir = os.path.expanduser(source["split_dir"])
-        print(f"[pipeline] Skipping download & split; using existing chunks: {parent_dir}\n")
+        pre_split_dir = os.path.expanduser(source["split_dir"])
+        print(f"[pipeline] Skipping download & split; using existing chunks: "
+              f"{pre_split_dir}\n")
+    elif source["input_path"]:
+        raw_dir = os.path.expanduser(source["input_path"])
+        print(f"[pipeline] === Step 0/4: using local raw folder {raw_dir} ===\n")
+        session_names = [name for name, _ in find_sessions(raw_dir)]
     else:
-        if source["input_path"]:
-            raw_dir = os.path.expanduser(source["input_path"])
-            print(f"[pipeline] === Step 0/4: using local raw folder {raw_dir} ===\n")
+        if source["work_dir"]:
+            raw_dir = os.path.expanduser(source["work_dir"])
         else:
-            if source["work_dir"]:
-                raw_dir = os.path.expanduser(source["work_dir"])
-            else:
-                timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
-                raw_dir = os.path.expanduser(
-                    f"~/.cache/scout/lab/raw_download/raw_{timestamp}"
-                )
-            # Printed as container/prefix so the log says exactly which slice of
-            # the corpus a run covered — the whole container, or one route.
-            source_desc = azure["input_container"]
-            if azure["input_prefix"]:
-                source_desc += "/" + azure["input_prefix"].strip("/")
-            print(f"[pipeline] === Step 0/4: downloading raw sessions from "
-                  f"'{source_desc}' ===")
-            print(f"[pipeline] Staging to: {raw_dir}")
-            sessions = azure_blob_io.download_sessions(
-                azure["input_container"], raw_dir,
-                pattern=azure["session_pattern"],
-                account_url=azure["account_url"],
-                prefix=azure["input_prefix"],
+            timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
+            raw_dir = os.path.expanduser(
+                f"~/.cache/scout/lab/raw_download/raw_{timestamp}"
             )
-            if not sessions:
-                raise SystemExit(
-                    f"[pipeline] No session folders matching "
-                    f"{azure['session_pattern']!r} found in "
-                    f"'{source_desc}'; aborting."
-                )
-            print(f"[pipeline] Sessions: {', '.join(sessions)}\n")
-
-        # --- Step 1: split --------------------------------------------------
-        print("[pipeline] === Step 1/4: splitting sessions ===")
-        parent_dir = run_split(
-            raw_dir,
-            output_root=split["split_out"],
-            fps=fps,
-            segment_minutes=split["segment_minutes"],
+        # Printed as container/prefix so the log says exactly which slice of
+        # the corpus a run covered — the whole container, or one route.
+        source_desc = azure["input_container"]
+        if azure["input_prefix"]:
+            source_desc += "/" + azure["input_prefix"].strip("/")
+        print(f"[pipeline] === Step 0/4: downloading raw sessions from "
+              f"'{source_desc}' ===")
+        print(f"[pipeline] Staging to: {raw_dir}")
+        session_names = azure_blob_io.download_sessions(
+            azure["input_container"], raw_dir,
+            pattern=azure["session_pattern"],
+            account_url=azure["account_url"],
+            prefix=azure["input_prefix"],
         )
-        if not parent_dir:
-            raise SystemExit("[pipeline] Split step produced no output; aborting.")
-
-    # --- Step 1.5: mask (optional) -----------------------------------------
-    if mask["apply_mask"]:
-        seg_weights = mask["seg_weights"]
-        det_weights = mask["det_weights"]
-
-        # Optionally pull the YOLO weights from Azure ML (workspace/registry)
-        # and use the downloaded local paths instead of mask.*_weights.
-        if models["enabled"]:
-            print("\n[pipeline] Fetching YOLO weights from Azure ML...")
-            client = azure_ml_models.get_client(
-                subscription_id=models["subscription_id"],
-                resource_group=models["resource_group"],
-                workspace_name=models["workspace_name"],
-                registry_name=models["registry_name"],
+        if not session_names:
+            raise SystemExit(
+                f"[pipeline] No session folders matching "
+                f"{azure['session_pattern']!r} found in "
+                f"'{source_desc}'; aborting."
             )
-            dl_dir = models["download_dir"] or os.path.expanduser(
-                "~/.cache/scout/lab/ml_models")
-            if models["seg_model_name"]:
-                seg_weights = azure_ml_models.download_weight(
-                    client, models["seg_model_name"], dl_dir,
-                    version=models["seg_model_version"],
-                    weight_filename=os.path.basename(mask["seg_weights"] or ""),
-                )
-            if models["det_model_name"]:
-                det_weights = azure_ml_models.download_weight(
-                    client, models["det_model_name"], dl_dir,
-                    version=models["det_model_version"],
-                    weight_filename=os.path.basename(mask["det_weights"] or ""),
-                )
+        print(f"[pipeline] Sessions: {', '.join(session_names)}\n")
 
-        print("\n[pipeline] === Step 2/4: masking session videos ===")
-        parent_dir = run_mask(
-            parent_dir=parent_dir,
-            output_dir=mask["mask_out"],
-            seg_mode=mask["seg_mode"],
+    # --- Step 0.5: partition sessions into train/test ----------------------
+    # (label, repo-id suffix, session names) per dataset to build. The
+    # single-entry default is the original, unsplit behaviour.
+    groups = [(None, "", None)]
+    if train_test["enabled"]:
+        train_sessions, test_sessions = partition_sessions(
+            session_names, train_test["test_ratio"], train_test["seed"],
+        )
+        print(f"[pipeline] === Train/test split (seed={train_test['seed']}, "
+              f"test_ratio={train_test['test_ratio']}) ===")
+        print(f"[pipeline] train ({len(train_sessions)} sessions): "
+              f"{', '.join(train_sessions)}")
+        print(f"[pipeline] test  ({len(test_sessions)} sessions): "
+              f"{', '.join(test_sessions)}")
+        groups = [
+            ("train", train_test["train_suffix"], train_sessions),
+            ("test", train_test["test_suffix"], test_sessions),
+        ]
+    else:
+        print("[pipeline] Train/test split disabled; building one dataset.")
+
+    # --- Resolve YOLO weights once, ahead of every group -------------------
+    seg_weights = mask["seg_weights"]
+    det_weights = mask["det_weights"]
+    if mask["apply_mask"] and models["enabled"]:
+        print("\n[pipeline] Fetching YOLO weights from Azure ML...")
+        client = azure_ml_models.get_client(
+            subscription_id=models["subscription_id"],
+            resource_group=models["resource_group"],
+            workspace_name=models["workspace_name"],
+            registry_name=models["registry_name"],
+        )
+        dl_dir = models["download_dir"] or os.path.expanduser(
+            "~/.cache/scout/lab/ml_models")
+        if models["seg_model_name"]:
+            seg_weights = azure_ml_models.download_weight(
+                client, models["seg_model_name"], dl_dir,
+                version=models["seg_model_version"],
+                weight_filename=os.path.basename(mask["seg_weights"] or ""),
+            )
+        if models["det_model_name"]:
+            det_weights = azure_ml_models.download_weight(
+                client, models["det_model_name"], dl_dir,
+                version=models["det_model_version"],
+                weight_filename=os.path.basename(mask["det_weights"] or ""),
+            )
+
+    # --- Steps 1-4, once per group -----------------------------------------
+    # One stamp for the whole run so each group's default split dir is named
+    # off the same moment, differing only by suffix.
+    run_stamp = datetime.now().strftime("%d%m%Y%H%M%S")
+    built = []
+    for label, suffix, only_sessions in groups:
+        dataset_root = build_dataset(
+            cfg,
+            label=label,
+            suffix=suffix,
+            only_sessions=only_sessions,
+            raw_dir=raw_dir,
+            pre_split_dir=pre_split_dir,
             seg_weights=seg_weights,
             det_weights=det_weights,
-            det_classes_to_keep=tuple(mask["det_classes"]),
-            seg_conf=mask["seg_conf"],
-            overlay_alpha=mask["overlay_alpha"],
-            in_place=mask["mask_in_place"],
-            fps=fps,
+            run_stamp=run_stamp,
         )
-    else:
-        print("\n[pipeline] Skipping mask step (mask.apply_mask is false).")
+        built.append((convert["repo_id"] + suffix, dataset_root))
 
-    # --- Step 2: convert ---------------------------------------------------
-    print("\n[pipeline] === Step 3/4: building LeRobot dataset ===")
-    dataset_root = run_convert(
-        parent_dir=parent_dir,
-        repo_id=convert["repo_id"],
-        task=convert["task"],
-        fps=fps,
-        robot_type=convert["robot_type"],
-        image_writer_threads=convert["image_writer_threads"],
-        video_encoding_batch_size=convert["video_encoding_batch_size"],
-        resume=convert["resume"],
-        push_to_hub=convert["push_to_hub"],
-        no_videos=convert["no_videos"],
-        no_obs_processor=convert["no_obs_processor"],
-    )
-    print(f"\n[pipeline] Dataset written to: {dataset_root}")
-
-    # --- Step 3: upload ----------------------------------------------------
-    if not azure["upload"]:
-        print("[pipeline] azure.upload is false; skipping dataset upload.")
-    else:
-        print(f"\n[pipeline] === Step 4/4: uploading dataset to container "
-              f"'{azure['output_container']}' ===")
-        azure_blob_io.upload_directory(
-            azure["output_container"], dataset_root,
-            dest_prefix=convert["repo_id"],
-            account_url=azure["account_url"],
-        )
-
-    print(f"\n[pipeline] Done. Dataset at: {dataset_root}")
+    print("\n[pipeline] Done.")
+    for repo_id, dataset_root in built:
+        print(f"[pipeline]   {repo_id}: {dataset_root}")
 
 
 if __name__ == "__main__":

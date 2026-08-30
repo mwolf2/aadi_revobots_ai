@@ -90,6 +90,33 @@ segment_minutes = 2
 # Where the split step writes its chunks. Empty = step default.
 split_out = ""
 
+[train_test_split]
+# Build two datasets instead of one, splitting the raw sessions into a held-out
+# test set and everything else. Off by default = the original single-dataset
+# behaviour, unchanged.
+#
+# The split is at the SESSION level, never the episode/chunk level: every
+# fixed-length chunk cut out of one raw session lands on the same side, so a
+# test session is a genuinely unseen recording rather than an interleaved
+# sample from one the policy already trained on. Steps 1-4 (split, mask,
+# convert, upload) then run once per side.
+#
+# Requires raw sessions — source.split_dir is rejected when this is enabled,
+# since its session_<i>/ chunks are numbered continuously across the raw
+# sessions they came from and those boundaries can no longer be recovered.
+enabled = false
+# Fraction of sessions held out for test. Clamped to leave at least one session
+# on each side, so a small corpus still produces two usable datasets.
+test_ratio = 0.2
+# Seed for the partition. Session names are sorted before shuffling, so the
+# same set of sessions plus the same seed reproduces the same split exactly,
+# on any machine and regardless of blob-listing order.
+seed = 42
+# Appended to convert.repo_id for each side: Revolabs/agv -> Revolabs/agv_train
+# and Revolabs/agv_test. Must both be non-empty and must differ.
+train_suffix = "_train"
+test_suffix = "_test"
+
 [mask]
 # Run semantic segmentation on every split mp4 before conversion.
 apply_mask = true

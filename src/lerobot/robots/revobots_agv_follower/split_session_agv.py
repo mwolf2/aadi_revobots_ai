@@ -120,13 +120,20 @@ def split_one_session(session_name, session_path, output_root, start_session_idx
     return session_idx
 
 
-def run_split(input_path, output_root=None, fps=15, segment_minutes=2):
+def run_split(input_path, output_root=None, fps=15, segment_minutes=2, only_sessions=None):
     """Split all sessions under `input_path` into fixed-length chunks.
 
     Returns the output_root path containing session_0/, session_1/, ...
     (the exact layout data_convert_agv expects), or None if nothing was
     written. If `output_root` is not given, a timestamped folder under
     ~/.cache/scout/lab/split_session/ is created.
+
+    `only_sessions` restricts the run to that iterable of raw session folder
+    names (as returned by find_sessions), ignoring every other session under
+    `input_path`. This is what makes a session-level train/test split possible
+    without copying or symlinking the raw corpus: the pipeline calls run_split
+    twice over the same input dir, once per side of the split, and each call
+    renumbers its own chunks from session_0 in its own output root.
     """
     input_path = os.path.expanduser(input_path)
 
@@ -135,6 +142,9 @@ def run_split(input_path, output_root=None, fps=15, segment_minutes=2):
         return None
 
     sessions = find_sessions(input_path)
+    if only_sessions is not None:
+        wanted = set(only_sessions)
+        sessions = [(name, path) for name, path in sessions if name in wanted]
     if not sessions:
         print(f"[!] No valid sessions (with video.mp4 + data.jsonl) found in {input_path}")
         return None
