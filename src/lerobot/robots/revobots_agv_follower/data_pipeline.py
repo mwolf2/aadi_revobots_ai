@@ -29,6 +29,13 @@ partition is at the session level, never the chunk/episode level — every chunk
 cut out of one raw session stays on the same side — and is seeded, so the same
 set of session names plus the same seed reproduces the same split exactly.
 
+Manifest / append mode (opt-in, used by revobots-ml's ctcd pipeline):
+    SESSION_MANIFEST=<path to manifest.json> downloads exactly the sessions it
+    lists (catalog raw_path values) instead of prefix+pattern matching, and takes
+    the dataset repo_id from it. APPEND=true adds the converted sessions as new
+    episodes after those already in that Hub dataset, instead of building a new
+    dataset. Neither is set by the other pipelines, which behave as before.
+
 Everything is driven by a TOML config file (default: pipeline.toml next to this
 script); the only command-line argument is --config. Credentials are read from
 the AZURE_STORAGE_CONNECTION_STRING environment variable — never from the TOML.
@@ -40,6 +47,7 @@ Example:
 """
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -146,6 +154,9 @@ def load_config(path):
             "upload": azure.get("upload", True),
         },
         "source": {
+            # Env only: a manifest is per-run, written by the caller's own
+            # session-selection step, never a static config value.
+            "manifest": opt(os.environ.get("SESSION_MANIFEST", "")),
             "input_path": opt(source.get("input_path", "")),
             "split_dir": opt(source.get("split_dir", "")),
             "work_dir": opt(source.get("work_dir", "")),
@@ -204,6 +215,7 @@ def load_config(path):
             "video_encoding_batch_size": convert.get("video_encoding_batch_size", 1),
             # Env var (passed via docker -e) overrides the TOML when set.
             "resume": env_bool("RESUME", convert.get("resume", False)),
+            "append": env_bool("APPEND", convert.get("append", False)),
             "push_to_hub": convert.get("push_to_hub", False),
             "no_videos": convert.get("no_videos", False),
             "no_obs_processor": convert.get("no_obs_processor", False),
@@ -334,6 +346,7 @@ def build_dataset(cfg, *, label, suffix, only_sessions, raw_dir, pre_split_dir,
         image_writer_threads=convert["image_writer_threads"],
         video_encoding_batch_size=convert["video_encoding_batch_size"],
         resume=convert["resume"],
+        append=convert["append"],
         push_to_hub=convert["push_to_hub"],
         no_videos=convert["no_videos"],
         no_obs_processor=convert["no_obs_processor"],
@@ -391,8 +404,29 @@ def main():
             hf_user_secret=keyvault["hf_user_secret"],
         )
 
+    manifest = None
+    if source["manifest"]:
+        if source["input_path"] or source["split_dir"]:
+            raise SystemExit("[pipeline] SESSION_MANIFEST is set; source.input_path "
+                             "and source.split_dir must both be empty.")
+        with open(source["manifest"], encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        if not manifest.get("sessions"):
+            raise SystemExit(f"[pipeline] Manifest {source['manifest']} lists no sessions.")
+        # The manifest names the dataset its sessions belong in; a repo_id from
+        # the TOML or REPO_ID could only disagree with it.
+        convert["repo_id"] = manifest["repo_id"]
+        print(f"[pipeline] Manifest: {len(manifest['sessions'])} session(s) "
+              f"for robot {manifest.get('robot_id')!r} -> {convert['repo_id']}")
+
     if not convert["repo_id"]:
         raise SystemExit("[pipeline] convert.repo_id is required in the config.")
+    if convert["append"] and convert["resume"]:
+        raise SystemExit("[pipeline] APPEND and RESUME are mutually exclusive.")
+    if convert["append"] and not convert["push_to_hub"]:
+        # Appending builds a local root holding only the NEW episodes; without
+        # the push there's no complete dataset anywhere.
+        raise SystemExit("[pipeline] APPEND requires convert.push_to_hub = true.")
 
     # Stamp the dataset name with the current date (MMDDYYYY) so each run is
     # uniquely identifiable both on disk/hub and in the upload prefix.
@@ -407,6 +441,11 @@ def main():
     # Validated before the download, not after: a bad suffix pair would collide
     # both sides onto one repo id, and there is no point discovering that after
     # pulling the whole corpus down.
+    if train_test["enabled"] and (manifest is not None or convert["append"]):
+        # A split partitions whatever sessions this run was given; appending
+        # would partition only the new ones, independently of every earlier run.
+        raise SystemExit("[pipeline] train_test_split.enabled can't be combined "
+                         "with SESSION_MANIFEST or APPEND.")
     if train_test["enabled"]:
         if source["split_dir"]:
             raise SystemExit(
@@ -429,7 +468,22 @@ def main():
     pre_split_dir = None
     session_names = []
 
-    if source["split_dir"]:
+    if manifest is not None:
+        if source["work_dir"]:
+            raw_dir = os.path.expanduser(source["work_dir"])
+        else:
+            timestamp = datetime.now().strftime("%d%m%Y%H%M%S")
+            raw_dir = os.path.expanduser(
+                f"~/.cache/scout/lab/raw_download/raw_{timestamp}"
+            )
+        print("[pipeline] === Step 0/4: downloading the manifest's sessions ===")
+        print(f"[pipeline] Staging to: {raw_dir}")
+        session_names = azure_blob_io.download_session_paths(
+            [s["raw_path"] for s in manifest["sessions"]], raw_dir,
+            account_url=azure["account_url"],
+        )
+        print(f"[pipeline] Sessions: {', '.join(session_names)}\n")
+    elif source["split_dir"]:
         pre_split_dir = os.path.expanduser(source["split_dir"])
         print(f"[pipeline] Skipping download & split; using existing chunks: "
               f"{pre_split_dir}\n")

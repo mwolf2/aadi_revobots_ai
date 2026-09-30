@@ -168,6 +168,77 @@ def download_sessions(
     return sorted(downloaded)
 
 
+def split_raw_path(raw_path: str) -> tuple[str, str]:
+    """Split a catalog raw_path ("/raw/route_a/session_X/") into
+    (container, blob prefix) — ("raw", "route_a/session_X/").
+
+    The first path segment is the container, the same convention the session
+    catalog's raw_path column uses.
+    """
+    parts = raw_path.strip("/").split("/", 1)
+    if len(parts) != 2 or not parts[1]:
+        raise ValueError(f"raw_path {raw_path!r} is not /<container>/<folder>/...")
+    return parts[0], parts[1].rstrip("/") + "/"
+
+
+def download_session_paths(
+    raw_paths,
+    dest_dir: str | os.PathLike,
+    account_url: str = None,
+) -> list[str]:
+    """Download exactly the session folders named by `raw_paths` — catalog
+    raw_path values like "/raw/route_a/session_X/" — into `dest_dir`.
+
+    The explicit-list counterpart to download_sessions(), for a caller that
+    already knows which sessions it wants (ctcd's manifest) instead of matching
+    every folder under a prefix. Each folder lands as dest_dir/<leaf>, the same
+    flat layout download_sessions() produces, so the split step can't tell the
+    two apart.
+
+    A path with no blobs under it is a hard error: the caller asked for that
+    session specifically, and silently building a dataset without it would
+    look like success.
+
+    Returns the sorted list of session folder names (leaves) downloaded.
+    """
+    service = _service(account_url)
+    dest_dir = Path(dest_dir)
+
+    downloaded: list[str] = []
+    n_blobs = 0
+    for raw_path in raw_paths:
+        container_name, prefix = split_raw_path(raw_path)
+        session = prefix.rstrip("/").rsplit("/", 1)[-1]
+        if session in downloaded:
+            # Two different folders with the same leaf name would land on top
+            # of each other in dest_dir.
+            raise SystemExit(f"[pipeline] Two sessions share the folder name "
+                             f"{session!r}; can't stage both under {dest_dir}.")
+        container = service.get_container_client(container_name)
+        found = 0
+        for blob in container.list_blobs(name_starts_with=prefix, include=["metadata"]):
+            rel = blob.name[len(prefix):]
+            if not rel or rel.endswith("/"):
+                continue
+            meta = getattr(blob, "metadata", None) or {}
+            if meta.get("hdi_isfolder") == "true":
+                continue
+            target = dest_dir / session / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            print(f"      [download] {container_name}/{blob.name} ({blob.size} bytes)")
+            with open(target, "wb") as fh:
+                container.download_blob(blob.name).readinto(fh)
+            found += 1
+        if not found:
+            raise SystemExit(f"[pipeline] No blobs under {container_name}/{prefix} "
+                             f"(from raw_path {raw_path!r}).")
+        downloaded.append(session)
+        n_blobs += found
+
+    print(f"[*] Downloaded {n_blobs} blob(s) across {len(downloaded)} session(s).")
+    return sorted(downloaded)
+
+
 def upload_directory(
     container_name: str,
     local_dir: str | os.PathLike,

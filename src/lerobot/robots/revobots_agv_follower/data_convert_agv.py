@@ -316,6 +316,10 @@ def parse_args():
     p.add_argument("--resume", action="store_true",
                    help="Resume into an existing dataset; skip session_<i>/ "
                         "folders whose episode index is already saved.")
+    p.add_argument("--append", action="store_true",
+                   help="Add every session_<i>/ as NEW episodes after those already "
+                        "in the Hub dataset --repo-id, instead of building a new "
+                        "dataset. Mutually exclusive with --resume.")
     p.add_argument("--push-to-hub", action="store_true",
                    help="Push to HuggingFace Hub after writing all episodes.")
     p.add_argument("--no-videos", action="store_true",
@@ -325,6 +329,69 @@ def parse_args():
                         "to the dataset. Use only if you also patch inference to "
                         "skip its observation processor. Default OFF (i.e. apply).")
     return p.parse_args()
+
+
+def _open_for_append(repo_id, *, fps, features, robot_type, use_videos,
+                     image_writer_threads, batch_encoding_size):
+    """Open the Hub dataset `repo_id` for appending new episodes.
+
+    Returns (dataset, number of episodes already in it).
+
+    Uses LeRobotDataset.resume(), lerobot's own "keep recording into an
+    existing dataset" entry point: it pulls the metadata (not the data or
+    videos) into a fresh local root, and its writer starts the first new
+    episode in the NEXT data/video/episode-metadata file rather than the latest
+    existing one. The local root therefore only ever holds new files plus the
+    cumulative meta/info.json / stats / tasks, and push_to_hub's upload_folder
+    never deletes, so every episode already on the Hub is left as it is.
+
+    A repo that exists but has no LeRobot data yet (no meta/info.json, e.g.
+    just created empty on the Hub) is created from scratch — there's nothing
+    to overwrite. Any other failure to load is a hard error, never a silent
+    fallback to create(): that fallback, followed by a push, would replace the
+    existing dataset's metadata with one that knows only the new episodes.
+    """
+    from datetime import datetime
+
+    from huggingface_hub import HfApi
+
+    # resume() refuses root=None (it would write into the shared Hub snapshot
+    # cache). A fresh directory per run also means no stale local copy can
+    # disagree with what's on the Hub.
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    root = Path(os.path.expanduser(
+        f"~/.cache/scout/lab/append/{repo_id.replace('/', '__')}_{stamp}"))
+
+    if not HfApi().file_exists(repo_id, "meta/info.json", repo_type="dataset"):
+        print(f"[*] {repo_id} has no LeRobot data yet; creating it.")
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            root=root,
+            fps=fps,
+            features=features,
+            robot_type=robot_type,
+            use_videos=use_videos,
+            image_writer_threads=image_writer_threads,
+            batch_encoding_size=batch_encoding_size,
+        )
+        return dataset, 0
+
+    dataset = LeRobotDataset.resume(
+        repo_id=repo_id,
+        root=root,
+        batch_encoding_size=batch_encoding_size,
+        image_writer_threads=image_writer_threads,
+    )
+    if dataset.meta.fps != fps:
+        raise SystemExit(f"[!] {repo_id} is recorded at {dataset.meta.fps} fps, "
+                         f"but this run converts at {fps}; refusing to append.")
+    missing = sorted(set(features) - set(dataset.meta.features))
+    if missing:
+        raise SystemExit(f"[!] {repo_id} has no feature(s) {missing} that this "
+                         f"run writes; refusing to append to a different schema.")
+    start_idx = dataset.meta.total_episodes
+    print(f"[*] Appending to {repo_id} after its {start_idx} existing episode(s).")
+    return dataset, start_idx
 
 
 def run_convert(
@@ -339,11 +406,16 @@ def run_convert(
     push_to_hub=False,
     no_videos=False,
     no_obs_processor=False,
+    append=False,
 ):
     """Build a LeRobot dataset from split sessions under `parent_dir`.
 
     Mirrors main() but takes plain kwargs so it can be called from a pipeline.
     Returns the dataset root path.
+
+    With `append`, every session under `parent_dir` is added as new episodes
+    after the ones already in the Hub dataset `repo_id` (see _open_for_append),
+    instead of building a new dataset that a push would then overwrite it with.
     """
     input_root = Path(os.path.expanduser(parent_dir)).resolve()
     if not input_root.is_dir():
@@ -358,6 +430,7 @@ def run_convert(
     print(f"[*] Repo id:       {repo_id}")
     print(f"[*] FPS:           {fps}")
     print(f"[*] Resume:        {resume}")
+    print(f"[*] Append:        {append}")
     print(f"[*] Obs processor: {'DISABLED' if no_obs_processor else 'ENABLED (symmetric with inference)'}")
 
     features = build_dataset_features()
@@ -381,8 +454,23 @@ def run_convert(
         print(f"      {k:35s}  dtype={dtype:8s}  shape={shape}  names={names}")
     print()
 
+    if append and resume:
+        raise SystemExit("[!] append and resume are mutually exclusive: resume "
+                         "continues an interrupted build of the SAME input; "
+                         "append adds NEW sessions to an existing dataset.")
+
     # --- Open or create the dataset (same calls as lerobot_record.record) --
-    if resume:
+    if append:
+        dataset, start_idx = _open_for_append(
+            repo_id,
+            fps=fps,
+            features=features,
+            robot_type=robot_type,
+            use_videos=not no_videos,
+            image_writer_threads=image_writer_threads,
+            batch_encoding_size=video_encoding_batch_size,
+        )
+    elif resume:
         try:
             dataset = LeRobotDataset(
                 repo_id=repo_id,
@@ -416,7 +504,10 @@ def run_convert(
         start_idx = 0
 
     # --- Process each session as one episode -------------------------------
-    todo = sessions[start_idx:]
+    # resume skips the chunks already saved from this same input; append's
+    # input is entirely new sessions, so every chunk becomes a new episode.
+    # start_idx only numbers them after the existing ones.
+    todo = sessions if append else sessions[start_idx:]
     print(f"[*] Processing {len(todo)} episode(s)...\n")
 
     total_frames = 0
@@ -497,6 +588,7 @@ def main():
         image_writer_threads=args.image_writer_threads,
         video_encoding_batch_size=args.video_encoding_batch_size,
         resume=args.resume,
+        append=args.append,
         push_to_hub=args.push_to_hub,
         no_videos=args.no_videos,
         no_obs_processor=args.no_obs_processor,
